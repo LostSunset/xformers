@@ -59,7 +59,6 @@ class ScaledTensor(torch.Tensor):
     # Disabling custom torch function handling for this class
     __torch_function__ = torch._C._disabled_torch_function_impl
 
-    @staticmethod
     def __new__(
         cls,
         data: torch.Tensor,

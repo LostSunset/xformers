@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import importlib.util
 import os
 from itertools import zip_longest
 from typing import Any, Iterable, List, Optional, Set, Tuple, Union
@@ -43,48 +44,51 @@ from .torch_attention_compat import is_pt_flash_compatible
 
 FLASH_VERSION = "0.0.0"
 VARLEN_LSE_PACKED = False
-_TRY_PT_FLASH_ATTN = torch.version.hip is None
+_TRY_PT_FLASH_ATTN = (
+    torch.version.hip is None and torch.backends.cuda.is_flash_attention_available()
+)
 _USE_PT_FLASH_ATTN = False
 
-try:
-    try:
-        from ... import _C_flashattention  # type: ignore[attr-defined]
-        from ..._cpp_lib import _build_metadata
 
-        if _build_metadata is not None:
-            FLASH_VERSION = _build_metadata.flash_version
-        VARLEN_LSE_PACKED = True
-    except ImportError:
-        try:
-            import flash_attn
-            import flash_attn.flash_attn_interface
+if importlib.util.find_spec("..._C_flashattention", package=__package__):
+    from ... import _C_flashattention  # type: ignore[attr-defined]
+    from ..._cpp_lib import _build_metadata
 
-            if hasattr(flash_attn.flash_attn_interface, "flash_attn_cuda"):
-                _C_flashattention = flash_attn.flash_attn_interface.flash_attn_cuda
-            else:
-                _C_flashattention = flash_attn.flash_attn_interface.flash_attn_gpu
+    if _build_metadata is not None:
+        FLASH_VERSION = _build_metadata.flash_version.lstrip("v")
+    VARLEN_LSE_PACKED = True
 
-            FLASH_VERSION = flash_attn.__version__
-            FLASH_VER_MIN = (2, 6, 3)
-            FLASH_VER_LAST = (2, 7, 4)  # last supported, inclusive
-            flash_ver_parsed = tuple(int(s) for s in FLASH_VERSION.split(".")[:3])
-            if (
-                flash_ver_parsed < FLASH_VER_MIN or flash_ver_parsed > FLASH_VER_LAST
-            ) and os.environ.get("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "0") != "1":
-                raise ImportError(
-                    f"Requires Flash-Attention version >={'.'.join([str(i) for i in FLASH_VER_MIN])},"
-                    f"<={'.'.join([str(i) for i in FLASH_VER_LAST])} "
-                    f"but got {FLASH_VERSION}."
-                )
-            VARLEN_LSE_PACKED = True
-        except ImportError as e:
-            if not _TRY_PT_FLASH_ATTN:
-                raise e
-            assert is_pt_flash_compatible(force=True)
-            FLASH_VERSION = torch.nn.attention._get_flash_version()  # type: ignore
-            FLASH_VERSION = f"v{FLASH_VERSION}"
-            VARLEN_LSE_PACKED = False
-            _USE_PT_FLASH_ATTN = True
+elif importlib.util.find_spec("flash_attn"):
+    import flash_attn
+    import flash_attn.flash_attn_interface
+
+    if hasattr(flash_attn.flash_attn_interface, "flash_attn_cuda"):
+        _C_flashattention = flash_attn.flash_attn_interface.flash_attn_cuda
+    else:
+        _C_flashattention = flash_attn.flash_attn_interface.flash_attn_gpu
+
+    FLASH_VERSION = flash_attn.__version__
+    FLASH_VER_MIN = (2, 7, 1)
+    FLASH_VER_LAST = (2, 7, 4)  # last supported, inclusive
+    flash_ver_parsed = tuple(int(s) for s in FLASH_VERSION.split(".")[:3])
+    if (
+        flash_ver_parsed < FLASH_VER_MIN or flash_ver_parsed > FLASH_VER_LAST
+    ) and os.environ.get("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "0") != "1":
+        raise ImportError(
+            f"Requires Flash-Attention version >={'.'.join([str(i) for i in FLASH_VER_MIN])},"
+            f"<={'.'.join([str(i) for i in FLASH_VER_LAST])} "
+            f"but got {FLASH_VERSION}."
+        )
+    VARLEN_LSE_PACKED = True
+
+elif _TRY_PT_FLASH_ATTN:
+    assert is_pt_flash_compatible(force=True)
+    FLASH_VERSION = torch.nn.attention._get_flash_version()  # type: ignore
+    VARLEN_LSE_PACKED = False
+    _USE_PT_FLASH_ATTN = True
+
+
+if FLASH_VERSION != "0.0.0":
 
     @torch.library.custom_op(
         "xformers_flash::flash_fwd",
@@ -345,9 +349,6 @@ try:
             return chunk.select(-3, 0), chunk.select(-3, 1), chunk.select(-3, 2)
         return torch.empty_like(query), torch.empty_like(key), torch.empty_like(value)
 
-except ImportError:
-    pass
-
 
 def _convert_input_format(
     inp: Inputs,
@@ -436,9 +437,8 @@ def _convert_input_format(
 
     if use_kvsplit:
         # For kvsplit case, we want
-        # q: [batch, seqlen, num_heads, head_dim_q]
-        # k: [batch x max_kv_len, num_heads, head_dim_kv]
-        # v: [batch x max_kv_len, num_heads, head_dim_kv]
+        # q: [batch, seqlen, num_heads, head_dim]
+        # k,v are already [batch x max_kv_len, num_heads, head_dim]
         assert query.ndim == 3 and key.ndim == 3 and value.ndim == 3
         batch = len(attn_bias.q_seqinfo.seqstart_py) - 1  # type: ignore
         query = query.view([batch, -1, query.shape[1], query.shape[2]])
